@@ -8,49 +8,68 @@ export const releaseExpiredReservations = async () => {
   const expiredOrders = await Order.find({
     status: "pending_payment",
     reservationExpiresAt: { $lte: now },
-  }).select("_id");
+  })
+    .select("_id")
+    .lean();
+
+  let releasedCount = 0;
 
   for (const candidate of expiredOrders) {
     const session = await mongoose.startSession();
 
     try {
       await session.withTransaction(async () => {
+        // Claim the expired reservation only once.
         const order = await Order.findOneAndUpdate(
           {
             _id: candidate._id,
             status: "pending_payment",
             reservationExpiresAt: { $lte: new Date() },
           },
-          { $set: { status: "expired" } },
-          { new: true, session }
+          {
+            $set: { status: "expired" },
+          },
+          {
+            new: true,
+            session,
+          },
         );
 
+        // Another request may already have processed this order.
         if (!order) return;
 
         for (const item of order.items) {
-          const food = await Food.findOne({
-            _id: item.food,
-            expiresAt: { $gt: new Date() },
-          }).session(session);
+          const food = await Food.findById(item.food).session(session);
 
+          // The food listing might have been deleted.
           if (!food) continue;
 
-          const nextQuantity = food.quantityAvailable + item.quantity;
+          const listingHasExpired = food.expiresAt <= new Date();
 
           await Food.updateOne(
             { _id: food._id },
             {
+              $inc: {
+                quantityAvailable: item.quantity,
+              },
               $set: {
-                quantityAvailable: nextQuantity,
-                status: "available",
+                // Never reactivate a listing past its expiry time.
+                status: listingHasExpired ? "expired" : "available",
               },
             },
-            { session }
+            { session },
           );
         }
+
+        releasedCount += 1;
       });
     } finally {
       await session.endSession();
     }
   }
+
+  return {
+    checkedCount: expiredOrders.length,
+    releasedCount,
+  };
 };
